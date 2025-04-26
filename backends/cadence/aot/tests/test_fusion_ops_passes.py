@@ -20,7 +20,7 @@ from executorch.backends.cadence.aot.fuse_ops import (
     FuseFullThenReshapePass,
     FuseMulIntoDequantPass,
     FuseQuantDequantToRequantizePass,
-    FuseTransposeOpPairsPass,
+    FuseTransposeOrPermuteOpPairsPass,
 )
 from executorch.backends.cadence.aot.graph_builder import GraphBuilder
 from executorch.backends.cadence.aot.pass_utils import count_node, op_counts_match
@@ -510,7 +510,7 @@ class TestFusionPasses(TestFusionPassesBase):
         )
 
 
-class TestFuseTransposeOpPairsPass(TestFusionPassesBase):
+class TestFuseTransposeOrPermuteOpPairsPass(TestFusionPassesBase):
     def _create_operator(
         self, builder: GraphBuilder, op: torch._ops.OpOverload, x: ProxyValue
     ) -> ProxyValue:
@@ -536,17 +536,17 @@ class TestFuseTransposeOpPairsPass(TestFusionPassesBase):
     def test_fuse_transpose_pairs(self, op: torch._ops.OpOverload):
         # Create a graph with transpose -> quant -> transpose.
         builder = GraphBuilder()
-        x = builder.placeholder("x", torch.randn(2, 3))
-        transpose_node = builder.call_operator(
+        x = builder.placeholder("x", torch.randn(2, 3, 4))
+        transpose_node0 = builder.call_operator(
             op=exir_ops.edge.aten.transpose_copy.int,
             args=(x, 0, 1),
         )
-        quant_node = self._create_operator(builder, op, transpose_node)
-        transpose_node = builder.call_operator(
+        quant_node = self._create_operator(builder, op, transpose_node0)
+        transpose_node1 = builder.call_operator(
             op=exir_ops.edge.aten.transpose_copy.int,
-            args=(quant_node, 0, 1),
+            args=(quant_node, 1, 2),
         )
-        builder.output([transpose_node])
+        builder.output([transpose_node1])
         gm = builder.get_graph_module()
         self.check_op_counts(
             gm,
@@ -557,13 +557,54 @@ class TestFuseTransposeOpPairsPass(TestFusionPassesBase):
         )
 
         # Check that the pass fuses the two transpose ops.
-        fusion_pass_result = FuseTransposeOpPairsPass()(gm)
+        fusion_pass_result = FuseTransposeOrPermuteOpPairsPass()(gm)
         self.assertIsNotNone(fusion_pass_result)
         gm_after_pass = fusion_pass_result.graph_module
         self.check_op_counts(
             gm_after_pass,
             expected_op_counts={
                 exir_ops.edge.aten.transpose_copy.int: 0,
+                op: 1,
+            },
+        )
+
+    @parameterized.expand(
+        [
+            exir_ops.edge.quantized_decomposed.quantize_per_tensor.default,
+            exir_ops.edge.cadence.quantized_relu.per_tensor,
+        ],
+    )
+    def test_fuse_permute_pairs(self, op: torch._ops.OpOverload):
+        # Create a graph with permute -> quant -> permute.
+        builder = GraphBuilder()
+        x = builder.placeholder("x", torch.randn(8, 2, 3, 4))
+        permute_node0 = builder.call_operator(
+            op=exir_ops.edge.aten.permute_copy.default,
+            args=(x, [0, 3, 1, 2]),
+        )
+        quant_node = self._create_operator(builder, op, permute_node0)
+        permute_node1 = builder.call_operator(
+            op=exir_ops.edge.aten.permute_copy.default,
+            args=(quant_node, [0, 2, 3, 1]),
+        )
+        builder.output([permute_node1])
+        gm = builder.get_graph_module()
+        self.check_op_counts(
+            gm,
+            expected_op_counts={
+                exir_ops.edge.aten.permute_copy.default: 2,
+                op: 1,
+            },
+        )
+
+        # Check that the pass fuses the two transpose ops.
+        fusion_pass_result = FuseTransposeOrPermuteOpPairsPass()(gm)
+        self.assertIsNotNone(fusion_pass_result)
+        gm_after_pass = fusion_pass_result.graph_module
+        self.check_op_counts(
+            gm_after_pass,
+            expected_op_counts={
+                exir_ops.edge.aten.permute_copy.default: 0,
                 op: 1,
             },
         )
@@ -595,11 +636,47 @@ class TestFuseTransposeOpPairsPass(TestFusionPassesBase):
         )
 
         # No fusion.
-        gm_after_pass = FuseTransposeOpPairsPass()(gm).graph_module
+        gm_after_pass = FuseTransposeOrPermuteOpPairsPass()(gm).graph_module
         self.check_op_counts(
             gm_after_pass,
             expected_op_counts={
                 exir_ops.edge.aten.transpose_copy.int: 2,
+                exir_ops.edge.quantized_decomposed.quantize_per_tensor.default: 1,
+            },
+        )
+
+    def test_no_fusion_for_permute_pairs(self):
+        # Create a graph with permute -> quant -> permute.
+        builder = GraphBuilder()
+        x = builder.placeholder("x", torch.randn(2, 3, 4))
+        permute_node = builder.call_operator(
+            op=exir_ops.edge.aten.permute_copy.default,
+            args=(x, [2, 0, 1]),
+        )
+        quant_node = builder.call_operator(
+            op=exir_ops.edge.quantized_decomposed.quantize_per_tensor.default,
+            args=(permute_node, 1.2, 3, 0, 127, torch.int8),
+        )
+        permute_node = builder.call_operator(
+            op=exir_ops.edge.aten.permute_copy.default,
+            args=(quant_node, [2, 0, 1]),
+        )
+        builder.output(permute_node)
+        gm = builder.get_graph_module()
+        self.check_op_counts(
+            gm,
+            expected_op_counts={
+                exir_ops.edge.aten.permute_copy.default: 2,
+                exir_ops.edge.quantized_decomposed.quantize_per_tensor.default: 1,
+            },
+        )
+
+        # No fusion.
+        gm_after_pass = FuseTransposeOrPermuteOpPairsPass()(gm).graph_module
+        self.check_op_counts(
+            gm_after_pass,
+            expected_op_counts={
+                exir_ops.edge.aten.permute_copy.default: 2,
                 exir_ops.edge.quantized_decomposed.quantize_per_tensor.default: 1,
             },
         )
@@ -636,7 +713,7 @@ class TestFuseTransposeOpPairsPass(TestFusionPassesBase):
         )
 
         # Fuse the all the transpose ops.
-        gm_after_pass = FuseTransposeOpPairsPass()(gm).graph_module
+        gm_after_pass = FuseTransposeOrPermuteOpPairsPass()(gm).graph_module
         self.check_op_counts(
             gm_after_pass,
             expected_op_counts={
